@@ -219,3 +219,6 @@ results/
 
 # System files
 .DS_Store
+
+# Tests
+tests/

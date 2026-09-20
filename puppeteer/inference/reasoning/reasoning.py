@@ -177,7 +177,8 @@ class GraphReasoning:
             'action': None,
             'next_state': None,
             'done': True,
-            'path_id': idx
+            'path_id': idx,
+            'termination_reason': reasoning_path.termination_reason,
             }
             print(transition)
             self.policy.finalize_task(transition, reasoning_path.global_info)
@@ -188,7 +189,8 @@ class GraphReasoning:
             'action': None,
             'next_state': None,
             'done': True,
-            'path_id': idx
+            'path_id': idx,
+            'termination_reason': reasoning_path.termination_reason,
             }
             print(transition)
             self.policy.finalize_task(transition, reasoning_path.global_info)

@@ -45,6 +45,7 @@ class GraphReasoningPath:
         self.env_name = env_name
 
         self.policy = policy
+        self.termination_reason = None
 
         self.global_info = global_info
         self.global_info.logger = self.logger
@@ -72,6 +73,7 @@ class GraphReasoningPath:
         self.frontier = [node_id]
 
         if terminated or len(self.agent_sequence) >= self.max_step_num:
+            self.termination_reason = "policy_stop" if terminated else "max_steps"
             self.state = ReasoningState.FINALIZING
             self.last_agent = self.current_agent
             if not terminated:
