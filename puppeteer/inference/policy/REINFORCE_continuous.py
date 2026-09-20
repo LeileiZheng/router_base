@@ -58,6 +58,20 @@ class ContinuousREINFORCE(LearningPolicy):
         self.gamma = self.config["training"]["gamma"]
         self.sample_size = self.config["training"]["sample_size"]
         self.lambda_kl_loss = self.config["training"]["lambda_kl_loss"]
+        self.entropy_coef = float(self.config["training"]["entropy_coef"])
+        if self.entropy_coef < 0:
+            raise ValueError("training.entropy_coef must be non-negative")
+
+        # Sequential base reward: task correctness minus a uniform cost for
+        # every router-selected reasoning-agent call.  These values are kept
+        # independent of token/model accounting, which remains available only
+        # as execution metadata.
+        reward_config = self.config["reward"]
+        self.task_reward_correct = float(reward_config["task_reward_correct"])
+        self.task_reward_incorrect = float(reward_config["task_reward_incorrect"])
+        self.call_cost = float(reward_config["call_cost"])
+        if self.call_cost < 0:
+            raise ValueError("reward.call_cost must be non-negative")
 
         # Legacy parallel-selection parameters. Sequential forward always samples
         # exactly one categorical action and does not use these values.
@@ -75,6 +89,7 @@ class ContinuousREINFORCE(LearningPolicy):
         self.state_representation = RewardModelTokenRepresentation()
         self.policy_network = MLP_PolicyNetwork(self.state_representation.dim, self.actions_dim) 
         self.policy_network = self.policy_network.to(self.device) 
+        self.policy_network.train(self.training)
         if not self.training:
             self.load_model(self.get_latest_model_path())
         if self.loading:
@@ -96,18 +111,10 @@ class ContinuousREINFORCE(LearningPolicy):
         self.llm_action_probs_history = []
         self.reward_from_rm = []
         self.accumulated_acc = []
-        self.entropy_history = []
 
-        # Setup actions and rewards
+        # Setup actions
         self.end_action = torch.tensor(self.agent_graph.terminator_agent_index, device=self.device)
         # self.web_actions = torch.tensor(self.agent_graph.search_agent_indices, device=self.device)
-        
-        # Initialize reward factors from config
-        reward_factors = self.config["agent"]["reward_factors"]
-        self.agent_reward_factor = [reward_factors["default"]] * self.actions_dim
-        self.agent_reward_factor[self.end_action.item()] = reward_factors["terminator"]
-        # for web_idx in self.web_actions:
-        #     self.agent_reward_factor[web_idx.item()] = reward_factors["web_search"]
 
         self.current_task = None
         # Legacy task-diff based lifecycle tracking. Query starts are now
@@ -122,22 +129,6 @@ class ContinuousREINFORCE(LearningPolicy):
         self.llm_policy = LLMPolicy(self.agent_graph, self.action_graph)
         
         atexit.register(self.save_model)
-
-    def logarithmic_cost(self, step):
-        """Calculate logarithmic cost using config parameters"""
-        scale = self.config["cost"]["scale"]
-        growth_rate = self.config["cost"]["growth_rate"]
-        # Normalize step to [0,1] range
-        normalized_step = (step + 1) / (self.max_step_num + 1)
-
-        if self.config["cost"]["inverse"]:
-            step_cost = scale * (1 - torch.log(torch.tensor(1 + growth_rate * normalized_step, device=self.device)) 
-                            / torch.log(torch.tensor(1 + growth_rate, device=self.device)))
-        else:
-            step_cost = scale * (torch.log(torch.tensor(1 + growth_rate * normalized_step, device=self.device)) 
-                            / torch.log(torch.tensor(1 + growth_rate, device=self.device)))
-        print("\033[1;33mstep cost: {}\033[0m".format(step_cost))
-        return step_cost
 
     def save_model(self, path=None, tag=None):
         """Save model with config"""
@@ -185,18 +176,27 @@ class ContinuousREINFORCE(LearningPolicy):
             agent_idx = torch.argmax(action_probs, dim=-1)
         return agent_idx, dist
 
-   
-    def append_to_trajectory(self, trajectory_idx, agent_idx, prob_value, global_info, prior_action_probs, m, rew=0):
-        cost = self.logarithmic_cost(len(self.current_trajectories[trajectory_idx])) * self.agent_reward_factor[agent_idx.item()]
-        self.current_trajectories[trajectory_idx].append({
+
+    def append_to_trajectory(self, trajectory_idx, agent_idx, prob_value, global_info, prior_action_probs, m, rew=0, entropy=None):
+        is_terminator = agent_idx.item() == self.end_action.item()
+        step_reward = torch.tensor(
+            0.0 if is_terminator else -self.call_cost,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        transition = {
             'prob': prob_value,
             'log_prob': m.log_prob(agent_idx),
             'state_identifier': global_info.workflow.state,
             'action': self.agent_role_list[agent_idx.item()],
-            'reward': cost,
+            'reward': step_reward,
+            'is_reasoning_call': not is_terminator,
             'reward_model': rew,
             'prior_prob': prior_action_probs[agent_idx.item()] if prior_action_probs is not None else None
-        })
+        }
+        if entropy is not None:
+            transition['entropy'] = entropy
+        self.current_trajectories[trajectory_idx].append(transition)
         print(trajectory_idx, self.current_trajectories[trajectory_idx])
 
     def forward(self, global_info):
@@ -210,14 +210,27 @@ class ContinuousREINFORCE(LearningPolicy):
             self.update_executed_trajectories()
 
         state, rew = self.get_state_representation(global_info)
-        action_probs = self.policy_network(state)
+        with torch.set_grad_enabled(self.training):
+            action_probs = self.policy_network(state)
+
+            # An empty trajectory has no answer to score.  Mask STOP before
+            # constructing the distribution so sampling, log_prob, and entropy
+            # all use exactly the same probabilities.
+            if is_initial_step:
+                action_probs = action_probs.clone()
+                action_probs[..., self.end_action.item()] = 0.0
+                probability_mass = action_probs.sum(dim=-1, keepdim=True)
+                if torch.any(probability_mass <= 0):
+                    raise ValueError("Initial action distribution has no non-STOP probability mass")
+                action_probs = action_probs / probability_mass
+
+            agent_idx, dist = self.select_single_agent(action_probs)
+            entropy = dist.entropy().squeeze(0) if self.training else None
+
         self.action_probs_history.append(action_probs.T.squeeze(1))
         self.reward_from_rm.append(rew)
         logger.info("Action probs: {}".format(action_probs))
 
-        entropy = -(action_probs * torch.log(action_probs + 1e-10)).sum()
-        self.entropy_history.append(entropy)
-        agent_idx, dist = self.select_single_agent(action_probs)
         assert agent_idx.numel() == 1, "Sequential routing must select one agent"
 
         self.current_trajectory_idx = 0
@@ -234,6 +247,7 @@ class ContinuousREINFORCE(LearningPolicy):
             None,
             dist,
             rew,
+            entropy,
         )
 
         agent_indices = agent_idx.reshape(-1)
@@ -264,153 +278,191 @@ class ContinuousREINFORCE(LearningPolicy):
         state, reward = self.state_representation(state_context)
         print(state, reward)
         return state, reward        
-    
-    def update(self):
-        logger.info("Update")   
-        logger.info("Executed trajectories: {}".format(self.executed_trajectories))
-        if not self.training:
-            metrics = {
-            'reasoning/action_probs': torch.sum(torch.stack(self.action_probs_history), dim=0),
-            "training/entropy": np.mean([e.detach().cpu().item() for e in self.entropy_history])
-            }
-            logger.info("metrics: {}".format(metrics))  
-            self.current_trajectories = []
-            self.executed_trajectories = []
-            self.entropy_history = []
-            self.execution_count = 0
-            return {}
-        if len(self.executed_trajectories) >= self.sample_size:
-            episode_returns = []
-            episode_lengths = []
-            episode_last_rewards = []
-            episode_acc = []
-            episode_tokens = []
-            episode_cost = []
-            episode_metrics = {}
-            kl_losses = []
-            logger.info("Update with sample size {}".format(self.sample_size))
-            policy_loss = []
-            episode_loss = []
-            for trajectories in self.executed_trajectories[:self.sample_size]:
-                task_avg_length = []
-                task_avg_reward = []
-                task_last_reward = []   
-                task_acc = []
-                task_avg_tokens = []
-                task_avg_cost = []
-                task_avg_metrics = []
-                for trajectory in trajectories:
-                    if trajectory[-1].get('finalized', False):
-                        logger.info("Trajectory: {}".format(trajectory))
-                        returns = self.calculate_returns(trajectory)
-                        # episode_returns.append(sum(returns))
-                        task_avg_reward.append(sum(returns))
-                        task_avg_length.append(len(trajectory))
-                        task_last_reward.append(
-                            trajectory[-1].get('terminal_reward', trajectory[-1].get('reward', 0))
-                        )
-                        task_avg_tokens.append(trajectory[-1].get('total_tokens', 0))
-                        task_avg_cost.append(trajectory[-1].get('total_cost', 0))
-                        task_avg_metrics.append(trajectory[-1].get('metrics', {}))
-                        if task_last_reward[-1] > 0:
-                            task_acc.append(1)
-                        else:
-                            task_acc.append(0)
-                        # task_acc.append(task_last_reward[-1].cpu().item())
-                        # episode_lengths.append(len(trajectory))
-                        print("returns: {}".format(returns))
-                        logger.info("Trajectory returns: {}".format(returns))
-                        
-                        for t, R in zip(trajectory, returns):
-                            if t.get('prob', None) is not None and t.get('prior_prob', None) is not None:
-                                kl_loss = t.get('prior_prob', 0) * torch.log(t['prior_prob'] / (t['prob']+1e-10))
-                                logger.info("Add KL loss: {}".format(kl_loss))
-                            else: 
-                                kl_loss = 0
-                                logger.info("No KL loss: {}".format(kl_loss))
-                            kl_loss = torch.tensor(kl_loss).to(self.device)
-                            kl_losses.append(kl_loss)
-                            loss = (-t['log_prob'] * R + self.lambda_kl_loss * kl_loss).to(self.device)
-                            
-                            if loss.dim() == 0:  # scalar loss, convert to shape [1]
-                                loss = loss.view(1)
-                            elif loss.dim() == 1:  # already [1], keep it
-                                pass
-                            policy_loss.append(loss)
-                            logger.info("loss for one sample: {}".format(policy_loss))
-                if len(task_avg_length) == 0:
-                    continue
-                else:
-                    episode_lengths.append(sum(task_avg_length)/len(task_avg_length))
-                if len(task_avg_reward) == 0:
-                    continue
-                else:
-                    episode_returns.append(sum(task_avg_reward)/len(task_avg_reward))
-                if len(task_last_reward) == 0:
-                    continue
-                else:
-                    episode_last_rewards.append(sum(task_last_reward)/len(task_last_reward))
-                if len(task_avg_tokens) == 0:
-                    continue
-                else:  
-                    episode_tokens.append(sum(task_avg_tokens)/len(task_avg_tokens))
-                if len(task_avg_cost) == 0:
-                    continue
-                else:
-                    episode_cost.append(sum(task_avg_cost)/len(task_avg_cost))
-                if len(task_acc) == 0:
-                    continue
-                else:
-                    episode_acc.append(sum(task_acc)/len(task_acc))
-                if len(task_avg_metrics) == 0:
-                    continue    
-                elif task_avg_metrics[0] == {}:
-                    continue
-                else:
-                    for key in task_avg_metrics[0].keys():
-                        if key not in episode_metrics:
-                            episode_metrics[key] = []
-                        episode_metrics[key].append(sum([m[key] for m in task_avg_metrics])/len(task_avg_metrics))
-                    
 
-            if policy_loss: 
-                logger.info("Policy loss: {}".format(policy_loss))
-                policy_loss = torch.stack(policy_loss).sum()/(self.sample_size)
-                logger.info("Policy loss stack: {}".format(policy_loss))
-                policy_loss -= sum(self.entropy_history)
-                logger.info("Policy loss with entropy: {}".format(policy_loss))
-                self.optimizer.zero_grad()
-                policy_loss.backward()
-                self.optimizer.step()
-                metrics = {
-                    'reasoning/action_probs': torch.sum(torch.stack(self.action_probs_history), dim=0),
-                    'reasoning/reward_from_rm': sum(self.reward_from_rm),
-                    'reasoning/acc': np.mean([a for a in episode_acc]),
-                    'reasoning/tokens': np.mean([t for t in episode_tokens]),
-                    'reasoning/cost': np.mean([c for c in episode_cost]),
-                    'training/policy_loss': policy_loss.item(),
-                    'reasoning/mean_return': np.mean([r.detach().cpu().item() for r in episode_returns]),
-                    'reasoning/mean_episode_length': np.mean(episode_lengths),
-                    'reasoning/mean_last_reward': np.mean([r.detach().cpu().item() for r in episode_last_rewards]),
-                    'training/mean_kl_loss': np.mean([kl.detach().cpu().item() for kl in kl_losses]),
-                    "training/entropy": np.mean([e.detach().cpu().item() for e in self.entropy_history]),
-                }
-                metrics.update({f'reasoning/{key}': np.mean([r.cpu().item() for r in episode_metrics[key]]) for key in episode_metrics})
-                logger.info("metrics: {}".format(metrics))  
-                self.global_step += 1
-                self.policy_losses.append(policy_loss.item())
-                self.current_trajectories = []
-                self.executed_trajectories = []
-                self.entropy_history = []
-                self.execution_count = 0
-                self.reward_from_rm = []
-                self.action_probs_history = []
-                self.llm_action_probs_history = []
-                return {
-                    'policy_loss': policy_loss.item(),
-                    'mean_reward': torch.tensor(returns, device=self.device).mean().item()
-                }
-        return {}
+    def _reset_batch_state(self):
+        """Release all graph-bearing tensors after an update or eval episode."""
+        self.current_trajectories = []
+        self.executed_trajectories = []
+        self.execution_count = 0
+        self.reward_from_rm = []
+        self.action_probs_history = []
+        self.llm_action_probs_history = []
+
+    def update(self):
+        logger.info("Update")
+        logger.info("Executed trajectories: {}".format(self.executed_trajectories))
+
+        if not self.training:
+            # Evaluation uses greedy selection and never constructs or consumes
+            # graph-bearing entropy records.
+            metrics = {}
+            if self.action_probs_history:
+                detached_probs = [probs.detach() for probs in self.action_probs_history]
+                metrics['reasoning/action_probs'] = torch.sum(
+                    torch.stack(detached_probs), dim=0
+                )
+                metrics['evaluation/entropy'] = torch.stack([
+                    torch.distributions.Categorical(probs=probs).entropy()
+                    for probs in detached_probs
+                ]).mean().item()
+            logger.info("metrics: {}".format(metrics))
+            self._reset_batch_state()
+            return {}
+
+        # Preserve the existing full-batch update gate.  Once the configured
+        # number of episode slots exists, normalize by the number that actually
+        # contains one valid finalized sequential trajectory.
+        if len(self.executed_trajectories) < self.sample_size:
+            return {}
+
+        batch_episodes = self.executed_trajectories[:self.sample_size]
+        valid_trajectories = []
+        for episode in batch_episodes:
+            episode_trajectories = [
+                trajectory
+                for trajectory in episode
+                if trajectory
+                and trajectory[-1].get('finalized', False)
+                and all(
+                    item.get('log_prob') is not None and item.get('entropy') is not None
+                    for item in trajectory
+                )
+            ]
+            if len(episode_trajectories) > 1:
+                raise ValueError("Sequential routing permits one valid trajectory per episode")
+            if episode_trajectories:
+                valid_trajectories.append(episode_trajectories[0])
+
+        effective_batch_size = len(valid_trajectories)
+        if effective_batch_size == 0:
+            logger.warning("Skipping update(): batch has no valid finalized trajectories")
+            self._reset_batch_state()
+            return {}
+
+        trajectory_pg_losses = []
+        trajectory_kl_losses = []
+        trajectory_entropies = []
+        episode_returns = []
+        episode_lengths = []
+        episode_last_rewards = []
+        episode_acc = []
+        episode_tokens = []
+        episode_cost = []
+        episode_metrics = {}
+
+        for trajectory in valid_trajectories:
+            logger.info("Trajectory: {}".format(trajectory))
+            returns = self.calculate_returns(trajectory)
+            print("returns: {}".format(returns))
+            logger.info("Trajectory returns: {}".format(returns))
+
+            step_pg_losses = []
+            step_kl_losses = []
+            for transition, step_return in zip(trajectory, returns):
+                step_pg_losses.append((-transition['log_prob'] * step_return).sum())
+                if transition.get('prob') is not None and transition.get('prior_prob') is not None:
+                    kl_value = transition['prior_prob'] * torch.log(
+                        transition['prior_prob'] / (transition['prob'] + 1e-10)
+                    )
+                    # Preserve the legacy detached KL behavior.  Its default
+                    # coefficient remains zero and its definition is outside
+                    # the scope of the entropy refactor.
+                    kl_value = kl_value.detach().clone().to(self.device)
+                else:
+                    kl_value = torch.zeros((), device=self.device)
+                step_kl_losses.append(kl_value.sum())
+
+            trajectory_pg_losses.append(torch.stack(step_pg_losses).sum())
+            trajectory_kl_losses.append(torch.stack(step_kl_losses).sum())
+            trajectory_entropies.append(torch.stack([
+                transition['entropy'].reshape(()) for transition in trajectory
+            ]).mean())
+
+            last_transition = trajectory[-1]
+            last_reward = last_transition.get(
+                'terminal_reward', last_transition.get('reward', 0)
+            )
+            episode_returns.append(returns.sum().detach())
+            episode_lengths.append(len(trajectory))
+            episode_last_rewards.append(torch.as_tensor(last_reward).detach())
+            episode_acc.append(1 if float(torch.as_tensor(last_reward).item()) > 0 else 0)
+            episode_tokens.append(last_transition.get('total_tokens', 0))
+            episode_cost.append(last_transition.get('total_cost', 0))
+            for key, value in last_transition.get('metrics', {}).items():
+                episode_metrics.setdefault(key, []).append(value)
+
+        policy_gradient_loss = torch.stack(trajectory_pg_losses).mean()
+        mean_kl_loss = torch.stack(trajectory_kl_losses).mean()
+        kl_regularization_loss = self.lambda_kl_loss * mean_kl_loss
+        entropy_mean = torch.stack(trajectory_entropies).mean()
+        entropy_regularization_loss = -self.entropy_coef * entropy_mean
+        total_loss = (
+            policy_gradient_loss
+            + kl_regularization_loss
+            + entropy_regularization_loss
+        )
+
+        logger.info("Policy-gradient loss: {}".format(policy_gradient_loss))
+        logger.info("Mean trajectory entropy: {}".format(entropy_mean))
+        logger.info("Entropy regularization loss: {}".format(entropy_regularization_loss))
+        logger.info("Total loss: {}".format(total_loss))
+
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        squared_gradient_norm = torch.zeros((), device=self.device)
+        for parameter in self.policy_network.parameters():
+            if parameter.grad is not None:
+                squared_gradient_norm += parameter.grad.detach().pow(2).sum()
+        gradient_norm = squared_gradient_norm.sqrt()
+        self.optimizer.step()
+
+        metrics = {
+            'reasoning/action_probs': torch.sum(
+                torch.stack(self.action_probs_history), dim=0
+            ),
+            'reasoning/reward_from_rm': sum(self.reward_from_rm),
+            'reasoning/acc': np.mean(episode_acc),
+            'reasoning/tokens': np.mean(episode_tokens),
+            'reasoning/cost': np.mean(episode_cost),
+            'reasoning/mean_return': torch.stack(episode_returns).mean().item(),
+            'reasoning/mean_last_reward': torch.stack(episode_last_rewards).float().mean().item(),
+            'training/policy_loss': total_loss.item(),
+            'training/policy_gradient_loss': policy_gradient_loss.item(),
+            'training/mean_kl_loss': mean_kl_loss.item(),
+            'training/kl_regularization_loss': float(torch.as_tensor(kl_regularization_loss).item()),
+            'training/entropy_mean': entropy_mean.item(),
+            'training/entropy_regularization_loss': entropy_regularization_loss.item(),
+            'training/total_loss': total_loss.item(),
+            'training/entropy_coef': self.entropy_coef,
+            'training/effective_batch_size': effective_batch_size,
+            'training/average_trajectory_length': float(np.mean(episode_lengths)),
+            'training/gradient_norm': gradient_norm.item(),
+        }
+        metrics.update({
+            f'reasoning/{key}': np.mean([
+                torch.as_tensor(value).detach().cpu().item()
+                for value in values
+            ])
+            for key, values in episode_metrics.items()
+        })
+        logger.info("metrics: {}".format(metrics))
+
+        self.global_step += 1
+        self.policy_losses.append(total_loss.item())
+        result = {
+            'policy_loss': total_loss.item(),
+            'policy_gradient_loss': policy_gradient_loss.item(),
+            'entropy_mean': entropy_mean.item(),
+            'entropy_regularization_loss': entropy_regularization_loss.item(),
+            'total_loss': total_loss.item(),
+            'entropy_coef': self.entropy_coef,
+            'effective_batch_size': effective_batch_size,
+            'average_trajectory_length': float(np.mean(episode_lengths)),
+            'gradient_norm': gradient_norm.item(),
+            'mean_reward': torch.stack(episode_returns).mean().item(),
+        }
+        self._reset_batch_state()
+        return result
     
     def finalize_task(self, transition, global_info):
         print("\033[1;33mtransition reward: {}\033[0m".format(transition.get('reward', 0)))
@@ -443,39 +495,57 @@ class ContinuousREINFORCE(LearningPolicy):
         if termination_reason == "max_steps" and last_transition.get("action") == terminator_role:
             raise ValueError("max_steps cannot synthesize or finalize a Terminator action")
 
-        for index, action in enumerate(global_info.workflow.workflow):
-            cost = action.cost
-            print("\033[1;33mtoken cost: {}\033[0m".format(cost))
-            print("\033[1;33mcost factor: {}\033[0m".format(cost/100000))
-            current_trajectory[index]["reward"] *= cost/100000
-            print("\033[1;33mReward: {}\033[0m".format(current_trajectory[index]['reward']))
+        workflow_actions = global_info.workflow.workflow
+        if len(workflow_actions) != len(current_trajectory):
+            raise ValueError(
+                "Finalized trajectory must correspond one-to-one with executed workflow actions"
+            )
+        for trajectory_item, workflow_action in zip(current_trajectory, workflow_actions):
+            executed_role = getattr(
+                workflow_action, 'agent_role', getattr(workflow_action, 'role', None)
+            )
+            if trajectory_item.get('action') != executed_role:
+                raise ValueError(
+                    "Trajectory action does not match the executed workflow action"
+                )
 
-        total_tokens = global_info.total_tokens
+        routing_agent_calls = sum(
+            getattr(action, 'agent_role', getattr(action, 'role', None)) != terminator_role
+            for action in workflow_actions
+        )
+        aggregation_calls = int(transition.get('aggregation_calls', 0))
+        routing_tokens = global_info.total_tokens
+        aggregation_tokens = int(transition.get('aggregation_tokens', 0))
+        total_tokens = routing_tokens + aggregation_tokens
         total_cost = global_info.total_cost
-        step_reward = self.logarithmic_cost(len(current_trajectory))
-        task_reward = transition.get('reward', 0)
-        terminator_bonus = self.agent_reward_factor[self.end_action.item()] * step_reward
-        if task_reward > 0:
-            terminal_reward = task_reward + terminator_bonus
-        else:
-            terminal_reward = task_reward - terminator_bonus
+        task_reward = torch.tensor(
+            float(transition.get('reward', self.task_reward_incorrect)),
+            dtype=torch.float32,
+            device=self.device,
+        )
 
         if termination_reason == "policy_stop":
-            # This is a real router-selected Terminator. Preserve its
-            # sampled log_prob and the legacy terminal reward formula.
-            last_transition['reward'] = terminal_reward
+            # The sampled Terminator is a real policy action.  It has no call
+            # cost and receives the task correctness reward exactly once.
+            last_transition['reward'] = task_reward
         else:
-            # Keep the last real agent's step/token-cost reward intact.
-            # calculate_returns() treats this reward as the following
-            # environment terminal event, with no action or log_prob.
-            last_transition['terminal_reward'] = terminal_reward
+            # max_steps is an environment event.  Keep the last real agent's
+            # uniform call cost and expose task correctness as a separate
+            # terminal reward with no action or log_prob.
+            last_transition['terminal_reward'] = task_reward
+        last_transition['task_reward'] = task_reward
+        last_transition['routing_agent_calls'] = routing_agent_calls
+        last_transition['aggregation_calls'] = aggregation_calls
+        last_transition['total_llm_calls'] = routing_agent_calls + aggregation_calls
+        last_transition['routing_tokens'] = routing_tokens
+        last_transition['aggregation_tokens'] = aggregation_tokens
         last_transition['total_tokens'] = total_tokens
         last_transition['total_cost'] = total_cost
         last_transition['finalized'] = True
         last_transition['termination_reason'] = termination_reason
         last_transition['metrics'] = transition.get('metrics', {})
-        print("\033[1;33mTerminal Reward: {}\033[0m".format(terminal_reward))
-        self.rewards_history.append(transition.get('reward', 0))
+        print("\033[1;33mTask Reward: {}\033[0m".format(task_reward))
+        self.rewards_history.append(float(task_reward.item()))
         return True
     
     def load_model(self, path, strict=True):

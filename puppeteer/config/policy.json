@@ -11,29 +11,25 @@
         "training": true,
         "learning_rate": 0.0001,
         "sample_size": 1,
-        "gamma": 0.99,
-        "lambda_kl_loss": 0.0
+        "gamma": 1.0,
+        "lambda_kl_loss": 0.0,
+        "entropy_coef": 0.0
     },
     "agent": {
         "max_num_agents": 3,
         "next_num_agents": 3,
         "max_path": 6,
-        "threshold": 0.5,
-        "reward_factors": {
-            "default": -1.0,
-            "terminator": 0.5,
-            "web_search": -1.5
-        }
+        "threshold": 0.5
     },
     "llm": {
         "prior": false,
         "prior_redistribution": false,
         "redistribution_weight": 0.1
     },
-    "cost": {
-        "scale": 0.1,
-        "growth_rate": 1.0,
-        "inverse": false
+    "reward": {
+        "task_reward_correct": 1.0,
+        "task_reward_incorrect": 0.0,
+        "call_cost": 0.02
     },
     "visualization": {
         "base_path": "results",

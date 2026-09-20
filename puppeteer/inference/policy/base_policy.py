@@ -21,9 +21,13 @@ class LearningPolicy(Policy):
         
     def train(self):
         self.training = True
+        if hasattr(self, "policy_network"):
+            self.policy_network.train()
         
     def eval(self):
         self.training = False
+        if hasattr(self, "policy_network"):
+            self.policy_network.eval()
     
     def update(self):
         pass

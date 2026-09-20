@@ -32,6 +32,8 @@ class GraphReasoning:
         
         self.final_answer = ""
         self.answers = []
+        self.aggregation_calls = 0
+        self.aggregation_tokens = 0
 
         self.global_logger = LogManager("puppeteer/config/global.yaml", self.task.get("type"))
 
@@ -131,13 +133,15 @@ class GraphReasoning:
         # return self.answers
 
     def aggregate_answers(self, global_info, answers:list, query_func=None) -> str:
+        # Never manufacture a scoreable answer through an unpriced aggregation
+        # call when no reasoning agent produced an answer.
+        if len(answers) == 0:
+            return None
+
         # only choose the last result without any format or extract
         if query_func is None:
-            if len(answers) == 0:
-                return None
-            else:
-                main_logger.info("[Aggregation] {}".format(answers[-1]))
-                return answers[-1] 
+            main_logger.info("[Aggregation] {}".format(answers[-1]))
+            return answers[-1]
         
         prompt_filepath = "puppeteer/prompts/general/answer_prompt.json" 
         with open(prompt_filepath, "r") as f:
@@ -154,7 +158,9 @@ class GraphReasoning:
         
         main_logger.info("[Aggregating] {}".format(answer_prompt))
         
-        raw_response, _ = query_func(messages=answer_prompt)
+        raw_response, total_tokens = query_func(messages=answer_prompt)
+        self.aggregation_calls += 1
+        self.aggregation_tokens += total_tokens
         main_logger.info("[Aggregation Answer] {}".format(raw_response))
         
         return raw_response if len(raw_response)!=0 else answers[-1]
@@ -174,24 +180,28 @@ class GraphReasoning:
         if self.task.get("type") == "MMLU-Pro":
             transition = {
             'state': reasoning_path.global_info.workflow.state,
-            'reward': 1 if BenchmarkEvaluator.check_mmlu(aggregated_answer, self.task.get("Answer")) else -1,
+            'reward': self.policy.task_reward_correct if BenchmarkEvaluator.check_mmlu(aggregated_answer, self.task.get("Answer")) else self.policy.task_reward_incorrect,
             'action': None,
             'next_state': None,
             'done': True,
             'path_id': idx,
             'termination_reason': reasoning_path.termination_reason,
+            'aggregation_calls': self.aggregation_calls,
+            'aggregation_tokens': self.aggregation_tokens,
             }
             print(transition)
             should_update_policy = self.policy.finalize_task(transition, reasoning_path.global_info)
         elif self.task.get("type") == "GSM-Hard":
             transition = {
             'state': reasoning_path.global_info.workflow.state,
-            'reward': 1 if BenchmarkEvaluator.check_gsm8k(aggregated_answer, self.task.get("Answer")) else -1,
+            'reward': self.policy.task_reward_correct if BenchmarkEvaluator.check_gsm8k(aggregated_answer, self.task.get("Answer")) else self.policy.task_reward_incorrect,
             'action': None,
             'next_state': None,
             'done': True,
             'path_id': idx,
             'termination_reason': reasoning_path.termination_reason,
+            'aggregation_calls': self.aggregation_calls,
+            'aggregation_tokens': self.aggregation_tokens,
             }
             print(transition)
             should_update_policy = self.policy.finalize_task(transition, reasoning_path.global_info)
