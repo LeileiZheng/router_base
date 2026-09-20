@@ -164,6 +164,7 @@ class GraphReasoning:
         assert len(self.reasoning_paths) == 1, "Sequential finalization must use exactly one path"
         reasoning_path = self.reasoning_paths[0]
         idx = 0
+        should_update_policy = True
 
         if hasattr(reasoning_path, "last_query_func"):
             aggregated_answer = self.aggregate_answers(reasoning_path.global_info, reasoning_path.global_info.state_answers, reasoning_path.last_query_func)
@@ -181,7 +182,7 @@ class GraphReasoning:
             'termination_reason': reasoning_path.termination_reason,
             }
             print(transition)
-            self.policy.finalize_task(transition, reasoning_path.global_info)
+            should_update_policy = self.policy.finalize_task(transition, reasoning_path.global_info)
         elif self.task.get("type") == "GSM-Hard":
             transition = {
             'state': reasoning_path.global_info.workflow.state,
@@ -193,13 +194,14 @@ class GraphReasoning:
             'termination_reason': reasoning_path.termination_reason,
             }
             print(transition)
-            self.policy.finalize_task(transition, reasoning_path.global_info)
+            should_update_policy = self.policy.finalize_task(transition, reasoning_path.global_info)
 
 
         if aggregated_answer is not None:
             self.answers.append(aggregated_answer)
             main_logger.info("[Aggregated Answer From Path {}]: {}".format(idx, aggregated_answer))
-        self.policy.update()
+        if should_update_policy:
+            self.policy.update()
         
         for agent in agent_global_registry.agents.values():
             agent.reset()

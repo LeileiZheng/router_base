@@ -220,5 +220,4 @@ results/
 # System files
 .DS_Store
 
-# Tests
-tests/
+# Tests are source files and should remain tracked.

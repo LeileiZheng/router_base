@@ -414,54 +414,69 @@ class ContinuousREINFORCE(LearningPolicy):
     
     def finalize_task(self, transition, global_info):
         print("\033[1;33mtransition reward: {}\033[0m".format(transition.get('reward', 0)))
+        if self.execution_count <= 0 or not self.executed_trajectories:
+            logger.warning("Ignoring finalize_task(): no active trajectory")
+            return False
+
         self.current_trajectories = self.executed_trajectories[self.execution_count-1]
         idx = transition.get('path_id', 0)
-        if self.current_trajectories and idx < len(self.current_trajectories):
-            current_trajectory = self.current_trajectories[idx]
-            for index, action in  enumerate(global_info.workflow.workflow):
-                cost = action.cost
-                print("\033[1;33mtoken cost: {}\033[0m".format(cost))
-                print("\033[1;33mcost factor: {}\033[0m".format(cost/100000))
-                current_trajectory[index]["reward"] *= cost/100000 
-                print("\033[1;33mReward: {}\033[0m".format(current_trajectory[index]['reward']))
-            if current_trajectory:
-                termination_reason = transition.get('termination_reason')
-                if termination_reason not in {"policy_stop", "max_steps"}:
-                    raise ValueError(f"Unknown termination reason: {termination_reason}")
+        if not self.current_trajectories or idx >= len(self.current_trajectories):
+            logger.warning("Ignoring finalize_task(): trajectory path does not exist")
+            return False
 
-                last_transition = current_trajectory[-1]
-                terminator_role = self.agent_role_list[self.end_action.item()]
-                if termination_reason == "policy_stop" and last_transition.get("action") != terminator_role:
-                    raise ValueError("policy_stop must correspond to a router-selected Terminator action")
-                if termination_reason == "max_steps" and last_transition.get("action") == terminator_role:
-                    raise ValueError("max_steps cannot synthesize or finalize a Terminator action")
+        current_trajectory = self.current_trajectories[idx]
+        if not current_trajectory:
+            logger.warning("Ignoring finalize_task(): trajectory is empty")
+            return False
+        if current_trajectory[-1].get('finalized', False):
+            logger.warning("Ignoring finalize_task(): trajectory is already finalized")
+            return False
 
-                total_tokens = global_info.total_tokens
-                total_cost = global_info.total_cost
-                step_reward = self.logarithmic_cost(len(current_trajectory))
-                task_reward = transition.get('reward', 0)
-                terminator_bonus = self.agent_reward_factor[self.end_action.item()] * step_reward
-                if task_reward > 0:
-                    terminal_reward = task_reward + terminator_bonus
-                else:
-                    terminal_reward = task_reward - terminator_bonus
+        termination_reason = transition.get('termination_reason')
+        if termination_reason not in {"policy_stop", "max_steps"}:
+            raise ValueError(f"Unknown termination reason: {termination_reason}")
 
-                if termination_reason == "policy_stop":
-                    # This is a real router-selected Terminator. Preserve its
-                    # sampled log_prob and the legacy terminal reward formula.
-                    last_transition['reward'] = terminal_reward
-                else:
-                    # Keep the last real agent's step/token-cost reward intact.
-                    # calculate_returns() treats this reward as the following
-                    # environment terminal event, with no action or log_prob.
-                    last_transition['terminal_reward'] = terminal_reward
-                last_transition['total_tokens'] = total_tokens
-                last_transition['total_cost'] = total_cost
-                last_transition['finalized'] = True
-                last_transition['termination_reason'] = termination_reason
-                last_transition['metrics'] = transition.get('metrics', {})
-                print("\033[1;33mTerminal Reward: {}\033[0m".format(terminal_reward))
+        last_transition = current_trajectory[-1]
+        terminator_role = self.agent_role_list[self.end_action.item()]
+        if termination_reason == "policy_stop" and last_transition.get("action") != terminator_role:
+            raise ValueError("policy_stop must correspond to a router-selected Terminator action")
+        if termination_reason == "max_steps" and last_transition.get("action") == terminator_role:
+            raise ValueError("max_steps cannot synthesize or finalize a Terminator action")
+
+        for index, action in enumerate(global_info.workflow.workflow):
+            cost = action.cost
+            print("\033[1;33mtoken cost: {}\033[0m".format(cost))
+            print("\033[1;33mcost factor: {}\033[0m".format(cost/100000))
+            current_trajectory[index]["reward"] *= cost/100000
+            print("\033[1;33mReward: {}\033[0m".format(current_trajectory[index]['reward']))
+
+        total_tokens = global_info.total_tokens
+        total_cost = global_info.total_cost
+        step_reward = self.logarithmic_cost(len(current_trajectory))
+        task_reward = transition.get('reward', 0)
+        terminator_bonus = self.agent_reward_factor[self.end_action.item()] * step_reward
+        if task_reward > 0:
+            terminal_reward = task_reward + terminator_bonus
+        else:
+            terminal_reward = task_reward - terminator_bonus
+
+        if termination_reason == "policy_stop":
+            # This is a real router-selected Terminator. Preserve its
+            # sampled log_prob and the legacy terminal reward formula.
+            last_transition['reward'] = terminal_reward
+        else:
+            # Keep the last real agent's step/token-cost reward intact.
+            # calculate_returns() treats this reward as the following
+            # environment terminal event, with no action or log_prob.
+            last_transition['terminal_reward'] = terminal_reward
+        last_transition['total_tokens'] = total_tokens
+        last_transition['total_cost'] = total_cost
+        last_transition['finalized'] = True
+        last_transition['termination_reason'] = termination_reason
+        last_transition['metrics'] = transition.get('metrics', {})
+        print("\033[1;33mTerminal Reward: {}\033[0m".format(terminal_reward))
         self.rewards_history.append(transition.get('reward', 0))
+        return True
     
     def load_model(self, path, strict=True):
         try:
