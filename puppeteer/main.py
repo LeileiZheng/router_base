@@ -33,9 +33,6 @@ def main():
     parser.add_argument("--mode", default='validation', choices=["validation", "test"])
     parser.add_argument("--level", type=int, default=1)
     parser.add_argument("--index", type=int, default=-1)
-    # Old default limited every run to one sample.
-    # parser.add_argument("--data_limit", type=int, default=1)
-    # Process the full dataset by default; pass --data_limit N to limit a run.
     parser.add_argument("--data_limit", type=int, default=None)
     parser.add_argument("--personas", type=str, default="puppeteer/personas/personas_sequential.jsonl")
 

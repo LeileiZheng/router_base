@@ -74,7 +74,13 @@ class GlobalInfo:
     
     def agent_role_list(self):
         return self.workflow.get_agent_role_list()
-    
+
+    def build_routing_state_context(self):
+        """Build the chronological context seen by the Sequential Router."""
+        return self.workflow.build_routing_state_context(
+            question=self.task.get("Question")
+        )
+
     def to_dict(self):
         return {
             "task": self.task,
@@ -88,4 +94,3 @@ class GlobalInfo:
             "env_name": self.env_name,
             "supervisor": self.supervisor
         }
-    

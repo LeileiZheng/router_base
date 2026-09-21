@@ -89,6 +89,53 @@ class Workflow:
             agent_role_list.append(role)
         return agent_role_list
 
+    def get_routing_history(self):
+        """Return executed routing steps in their real workflow order.
+
+        Action.result["answer"] is a cumulative final-answer field, so it is
+        intentionally excluded here. step_data is the output produced by the
+        current action. Terminator actions are policy events and do not
+        contribute a reasoning output to the next router state.
+        """
+        history = []
+        for action in self.workflow:
+            action_name = action.action.get("action") if action.action else None
+            if action.agent_role == "TerminatorAgent" or action_name in TERMINATION_ACTION_LIST:
+                continue
+
+            result = action.result if isinstance(action.result, dict) else {}
+            output = result.get("step_data")
+            history.append(
+                {
+                    "step": len(history),
+                    "agent_role": action.agent_role,
+                    "output": "" if output is None else str(output),
+                }
+            )
+        return history
+
+    def build_routing_state_context(self, question):
+        """Serialize the question and ordered routing history for the encoder."""
+        messages = [
+            {
+                "role": "system",
+                "content": "You are an assistant. Your task is to {}".format(question),
+            }
+        ]
+        for item in self.get_routing_history():
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "STEP {step}\n"
+                        "AGENT: {agent_role}\n"
+                        "OUTPUT:"
+                    ).format(**item),
+                }
+            )
+            messages.append({"role": "assistant", "content": item["output"]})
+        return messages
+
     @property
     def language_state(self):
         state = []

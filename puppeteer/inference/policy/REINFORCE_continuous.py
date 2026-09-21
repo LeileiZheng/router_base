@@ -274,9 +274,7 @@ class ContinuousREINFORCE(LearningPolicy):
         return torch.tensor(returns, device=self.device)
     
     def get_state_representation(self, global_info):
-        role_list = global_info.agent_role_list()
-        print(role_list)
-        state_context = self.agent_graph.get_agent_dialog_history(role_list, question=global_info.task.get("Question"))
+        state_context = global_info.build_routing_state_context()
         print(state_context)
         print(type(state_context))
         state, reward = self.state_representation(state_context)
