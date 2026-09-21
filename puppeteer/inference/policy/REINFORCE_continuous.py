@@ -52,7 +52,11 @@ class ContinuousREINFORCE(LearningPolicy):
         
         # Training parameters
         self.model_path = self.config["paths"]["model_path"]
-        self.training = self.config["training"]["training"]
+        configured_training = bool(self.config["training"].get("training", True))
+        dataset_mode = self.config.get("dataset_mode")
+        # validation/test are evaluation modes in the CLI.  Keep this guard in
+        # the policy as well as main.py so a stale config cannot enable updates.
+        self.training = configured_training and dataset_mode not in {"validation", "test"}
         self.loading = self.config["training"]["loading"]
         self.learning_rate = self.config["training"]["learning_rate"]
         self.gamma = self.config["training"]["gamma"]

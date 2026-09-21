@@ -8,7 +8,7 @@
     },
     "training": {
         "loading": false,
-        "training": true,
+        "training": false,
         "learning_rate": 0.0001,
         "sample_size": 1,
         "gamma": 1.0,

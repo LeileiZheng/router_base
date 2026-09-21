@@ -165,6 +165,20 @@ class GraphReasoning:
         
         return raw_response if len(raw_response)!=0 else answers[-1]
 
+    def extract_final_answer(self, answers:list):
+        """Return the latest answer explicitly produced by a reasoning agent.
+
+        Final-answer extraction is deliberately independent of the termination
+        reason.  In particular, the last agent's raw output is not a fallback:
+        an agent may finish without producing a new ``FINAL ANSWER``.
+        """
+        if not answers:
+            return None
+
+        final_answer = answers[-1]
+        main_logger.info("[Final Answer From State]: {}".format(final_answer))
+        return final_answer
+
     def finalize(self):
         print("-"*10+"\033[1;31mGraph Reasoning Finalize\033[0m"+"-"*10)
         assert len(self.reasoning_paths) == 1, "Sequential finalization must use exactly one path"
@@ -172,15 +186,14 @@ class GraphReasoning:
         idx = 0
         should_update_policy = True
 
-        if hasattr(reasoning_path, "last_query_func"):
-            aggregated_answer = self.aggregate_answers(reasoning_path.global_info, reasoning_path.global_info.state_answers, reasoning_path.last_query_func)
-        else:
-            aggregated_answer = self.aggregate_answers(reasoning_path.global_info, reasoning_path.global_info.state_answers)
+        final_answer = self.extract_final_answer(
+            reasoning_path.global_info.state_answers
+        )
 
         if self.task.get("type") == "MMLU-Pro":
             transition = {
             'state': reasoning_path.global_info.workflow.state,
-            'reward': self.policy.task_reward_correct if BenchmarkEvaluator.check_mmlu(aggregated_answer, self.task.get("Answer")) else self.policy.task_reward_incorrect,
+            'reward': self.policy.task_reward_correct if BenchmarkEvaluator.check_mmlu(final_answer, self.task.get("Answer")) else self.policy.task_reward_incorrect,
             'action': None,
             'next_state': None,
             'done': True,
@@ -194,7 +207,7 @@ class GraphReasoning:
         elif self.task.get("type") == "GSM-Hard":
             transition = {
             'state': reasoning_path.global_info.workflow.state,
-            'reward': self.policy.task_reward_correct if BenchmarkEvaluator.check_gsm8k(aggregated_answer, self.task.get("Answer")) else self.policy.task_reward_incorrect,
+            'reward': self.policy.task_reward_correct if BenchmarkEvaluator.check_gsm8k(final_answer, self.task.get("Answer")) else self.policy.task_reward_incorrect,
             'action': None,
             'next_state': None,
             'done': True,
@@ -207,19 +220,16 @@ class GraphReasoning:
             should_update_policy = self.policy.finalize_task(transition, reasoning_path.global_info)
 
 
-        if aggregated_answer is not None:
-            self.answers.append(aggregated_answer)
-            main_logger.info("[Aggregated Answer From Path {}]: {}".format(idx, aggregated_answer))
+        if final_answer is not None:
+            self.answers.append(final_answer)
+            main_logger.info("[Final Answer From Path {}]: {}".format(idx, final_answer))
         if should_update_policy:
             self.policy.update()
         
         for agent in agent_global_registry.agents.values():
             agent.reset()
         
-        if len(self.answers) == 0:
-            self.final_answer = ""
-        else:
-            self.final_answer = aggregated_answer
+        self.final_answer = final_answer
         
         main_logger.info("[Final Answer]: {}".format(self.final_answer))   
         print("-"*10+"\033[1;31mGraph Reasoning Finalized\033[0m"+"-"*10)

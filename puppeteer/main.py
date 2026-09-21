@@ -8,6 +8,24 @@ from tasks import mmlu_pro, gsm_hard
 # SRDD / CW are temporarily disabled in the sequential-only setup.
 # from tasks import srdd, creative_writing
 
+
+EVALUATION_MODES = frozenset({"validation", "test"})
+
+
+def configure_policy_for_mode(config, task, mode):
+    """Apply the dataset/checkpoint mode and its training safety policy."""
+    config["dataset_name"] = task
+    config["dataset_mode"] = mode
+    config['paths']["checkpoint_path"] = f"checkpoint/sequential/{task}_{mode}"
+    config['paths']["model_path"] = f"checkpoint/sequential/{task}_{mode}/policy_net_latest.pt"
+
+    # This CLI exposes evaluation modes only.  They must never update the
+    # policy, even if an old policy.json had training=true.
+    if mode in EVALUATION_MODES:
+        config.setdefault("training", {})["training"] = False
+    return config
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run benchmark tasks")
     # parser.add_argument("--task", default='MMLU-Pro', choices=["MMLU-Pro", "gsm-hard", "SRDD", "CW"])
@@ -37,10 +55,7 @@ def main():
     config_path = "puppeteer/config/policy.json"
     with open(config_path, 'r') as f:
         config = json.load(f)
-    config["dataset_name"] = args.task
-    config["dataset_mode"] = args.mode
-    config['paths']["checkpoint_path"] = f"checkpoint/sequential/{args.task}_{args.mode}"
-    config['paths']["model_path"] = f"checkpoint/sequential/{args.task}_{args.mode}/policy_net_latest.pt"
+    configure_policy_for_mode(config, args.task, args.mode)
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=4)
 

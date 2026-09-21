@@ -76,8 +76,6 @@ class GraphReasoningPath:
             self.termination_reason = "policy_stop" if terminated else "max_steps"
             self.state = ReasoningState.FINALIZING
             self.last_agent = self.current_agent
-            if not terminated:
-                self.last_query_func = self.current_agent.query_func
             return self.state
         
         next_agents_idx = self.policy.forward(self.global_info)
